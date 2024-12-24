@@ -2,13 +2,39 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
+import json
 import logging
 import time
+import urllib
 
-import requests
-from mopidy import httpclient
+from urllib.request import urlopen, Request
+
+import math
 
 logger = logging.getLogger(__name__)
+
+REGIONS = {
+    'at': 'de-AT',
+    'au': 'en-AU',
+    'br': 'pt-BR',
+    'ca': 'en-CA',
+    'co': 'es-CO',
+    'de': 'de-DE',
+    'dk': 'da-DK',
+    'es': 'es-ES',
+    'fr': 'fr-FR',
+    'ie': 'en-IE',
+    'it': 'it-IT',
+    'mx': 'es-MX',
+    'nl': 'nl-NL',
+    'nz': 'en-NZ',
+    'pl': 'pl-PL',
+    'pt': 'pt-PT',
+    'se': 'sv-SE',
+    'uk': 'en-GB',
+    'us': 'en-US',
+    'za': 'en-ZA',
+}
 
 
 class Station(object):
@@ -28,10 +54,10 @@ class Station(object):
 
 
 class RadioNetClient(object):
-    base_url = "https://radio.net/"
+    base_url = "https://prod.radio-api.net"
+    language = REGIONS['us']
+    user_agent = 'Radio.net - Web V5'
 
-    session = requests.Session()
-    api_prefix = None
     min_bitrate = 96
     max_top_stations = 100
     station_bookmarks = None
@@ -56,50 +82,26 @@ class RadioNetClient(object):
     def __init__(self, proxy_config=None, user_agent=None):
         super(RadioNetClient, self).__init__()
 
-        self.session = requests.Session()
-
-        if proxy_config is not None:
-            proxy = httpclient.format_proxy(proxy_config)
-            self.session.proxies.update({"http": proxy, "https": proxy})
-
-        full_user_agent = httpclient.format_user_agent(user_agent)
-        self.session.headers.update({"user-agent": full_user_agent})
-        self.session.headers.update({"cache-control": "no-cache"})
-
-        self.update_prefix()
-
-    def __del__(self):
-        self.session.close()
-
     def set_lang(self, lang):
-        if lang == "en":
-            lang = "net"
-        langs = ["net", "de", "at", "fr", "pt", "es", "dk", "se", "it", "pl"]
-        self.base_url = "https://radio.net/"
-        if lang in langs:
-            self.base_url = self.base_url.replace(".net", "." + lang)
+        if lang in REGIONS:
+            self.language = REGIONS[lang]
         else:
             logging.warning("Radio.net not supported language: %s, defaulting to English", str(lang))
-        self.update_prefix()
-
-    def update_prefix(self):
-        lang = self.base_url.split(".")[-1].replace("/", "")
-        self.api_prefix = "https://api.radio." + lang + "/info/v2"
-
-    def set_apikey(self, api_key):
-        self.api_key = api_key
 
     def do_get(self, api_suffix, url_params=None):
-        if self.api_prefix is None:
-            return None
+        try:
+            url = self.base_url + api_suffix
+            if url_params is not None:
+                url += "?" + urllib.parse.urlencode(url_params)
+            req = Request(url)
+            req.add_header('accept-language', self.language)
+            req.add_header('user-agent', self.user_agent)
+            response = urlopen(req).read()
+        except Exception as err:
+            logging.error(f'_open_url error: {err}')
+            response = None
 
-        if url_params is None:
-            url_params = {}
-        url_params["apikey"] = self.api_key
-
-        response = self.session.get(self.api_prefix + api_suffix, params=url_params)
-
-        return response
+        return json.loads(response)
 
     def get_cache(self, key):
         if self.cache.get(key) is not None and self.cache[key].expired() is False:
@@ -126,52 +128,25 @@ class RadioNetClient(object):
         if cache is not None:
             return cache
 
-        api_suffix = "/search/station"
+        api_suffix = "/stations/details"
 
         url_params = {
-            "station": station_id,
+            "stationIds": station_id,
         }
 
         response = self.do_get(api_suffix, url_params)
 
-        if response.status_code != 200:
-            logger.error(
-                "Radio.net: Error on get station by id "
-                + str(station_id)
-                + ". Error: "
-                + response.text
-            )
+        if response is None or len(response) == 0:
+            logger.error("Radio.net: Error on get station by id " + str(station_id))
             return False
 
         logger.debug("Radio.net: Done get top stations list")
-        json = response.json()
 
-        if not self.stations_by_id.get(json["id"]):
-            station = Station()
-            station.playable = True
-        else:
-            station = self.stations_by_id[json["id"]]
-        station.id = json["id"]
-        station.continent = json["continent"]
-        station.country = json["country"]
-        station.city = json["city"]
-        station.genres = ", ".join(json["genres"])
-        station.name = json["name"]
-        station.slug = json["subdomain"]
-        station.stream_url = self._get_stream_url(json["streamUrls"], self.min_bitrate)
-        station.image_tiny = json["logo44x44"]
-        station.image_small = json["logo100x100"]
-        station.image_medium = json["logo175x175"]
-        station.image_large = json["logo300x300"]
-        station.description = json["shortDescription"]
-        if json["playable"] == "PLAYABLE":
-            station.playable = True
+        json = response[0]
 
-        self.stations_by_id[station.id] = station
-        self.stations_by_slug[station.slug] = station
+        station = self._get_station_from_search_result(json)
 
-        self.set_cache("station/" + str(station.id), station, 1440)
-        self.set_cache("station/" + station.slug, station, 1440)
+        self.set_cache(cache_key, station, 1440)
         return station
 
     def _get_station_from_search_result(self, result):
@@ -182,42 +157,56 @@ class RadioNetClient(object):
             station = self.stations_by_id[result["id"]]
 
         station.id = result["id"]
-        if result["continent"] is not None:
-            station.continent = result["continent"]["value"]
-        else:
-            station.continent = ""
 
-        if result["country"] is not None:
-            station.country = result["country"]["value"]
+        if "country" in result:
+            station.country = result["country"]
         else:
             station.country = ""
 
-        if result["city"] is not None:
-            station.city = result["city"]["value"]
+        if "city" in result:
+            station.city = result["city"]
         else:
             station.city = ""
 
-        if result["name"] is not None:
-            station.name = result["name"]["value"]
+        if "name" in result:
+            station.name = result["name"]
         else:
             station.name = ""
 
-        if result["subdomain"] is not None:
-            station.slug = result["subdomain"]["value"]
-        else:
-            station.slug = ""
-
-        if result["shortDescription"] is not None:
-            station.description = result["shortDescription"]["value"]
+        if "shortDescription" in result:
+            station.description = result["shortDescription"]
         else:
             station.description = ""
 
-        station.image_tiny = result["logo44x44"]
-        station.image_small = result["logo100x100"]
-        station.image_medium = result["logo175x175"]
+        if "genres" in result:
+            station.genres = ", ".join(result["genres"])
+        else:
+            station.genres = ""
+
+        if "logo44x44" in result:
+            station.image_tiny = result["logo44x44"]
+        else:
+            station.image_tiny = ""
+
+        if "logo100x100" in result:
+            station.image_tiny = result["logo100x100"]
+        else:
+            station.image_tiny = ""
+
+        if "logo175x175" in result:
+            station.image_medium = result["logo175x175"]
+        else:
+            station.image_medium = ""
+
+        if "logo300x300" in result:
+            station.image_large = result["logo300x300"]
+        else:
+            station.image_large = ""
+
+        if "streams" in result:
+            station.stream_url = self._get_stream_url(result["streams"], self.min_bitrate)
 
         self.stations_by_id[station.id] = station
-        self.stations_by_slug[station.slug] = station
         return station
 
     def get_genres(self):
@@ -240,106 +229,100 @@ class RadioNetClient(object):
         if cached is not None:
             return cached
 
-        api_suffix = "/search/get" + key
+        api_suffix = "/stations/tags"
         response = self.do_get(api_suffix)
-        if response.status_code != 200:
-            logger.error(
-                "Radio.net: Error on get item list "
-                + str(api_suffix)
-                + ". Error: "
-                + response.text
-            )
+        if response is None:
+            logger.error("Radio.net: Error on get item list")
             return False
-        return self.set_cache(key, response.json(), 1440)
 
-    def get_sorted_category(self, category, name, sorting, page):
+        return self.set_cache(key, self._filter_result(response, key, 0), 1440)
+
+    def _filter_result(self, data, tag, min_count_stations):
+        api_result = data.get(tag, [])
+
+        if api_result and min_count_stations:
+            # filter result by minimum count of stations
+            result = []
+
+            for item in api_result:
+                if item['count'] >= min_count_stations:
+                    result.append(item)
+
+            return result
+
+        return api_result
+
+    def get_category(self, category, name, page=1):
         results = []
-        for result in self._get_sorted_category(category, name, sorting, page):
+        for result in self._get_category(category, name, page):
             results.append(self._get_station_from_search_result(result))
         return results
 
-    def _get_sorted_category(self, category, name, sorting, page):
+    def _get_category(self, category, name, page=1):
 
-        if sorting == "az":
-            sorting = "STATION_NAME"
-        else:
-            sorting = "RANK"
-
-        cache_key = category + "/" + name + "/" + sorting + "/" + str(page)
+        cache_key = category + "/" + name + "/" + str(page)
         cache = self.get_cache(cache_key)
         if cache is not None:
             return cache
 
-        api_suffix = "/search/stationsby" + self.category_param_map[category]
+        api_suffix = "/stations/by-tag"
         url_params = {
-            self.category_param_map[category]: name,
-            "sorttype": sorting,
-            "sizeperpage": 50,
-            "pageindex": page,
+            "tagType": category,
+            "slug": name,
+            "count": 50,
+            "offset": (page - 1) * 50,
         }
 
         response = self.do_get(api_suffix, url_params)
 
-        if response.status_code != 200:
-            logger.error(
-                "Radio.net: Error on get station by "
-                + str(category)
-                + ". Error: "
-                + response.text
-            )
+        if response is None:
+            logger.error("Radio.net: Error on get station by " + str(category))
             return False
 
-        json = response.json()
-        self.set_cache(category + "/" + name, int(json["numberPages"]), 10)
-        return self.set_cache(cache_key, json["categories"][0]["matches"], 10)
+        self.set_cache(category + "/" + name, int(math.ceil(response["totalCount"] / 50)), 10)
+        return self.set_cache(cache_key, response["playables"], 10)
 
-    def get_category(self, category, page):
+    def get_simple_category(self, category, page=1):
         results = []
-        for result in self._get_category(category, page):
+        for result in self._get_simple_category(category, page):
             results.append(self._get_station_from_search_result(result))
         return results
 
-    def _get_category(self, category, page):
+    def _get_simple_category(self, category, page=1):
         cache_key = category + "/" + str(page)
         cache = self.get_cache(cache_key)
         if cache is not None:
             return cache
 
-        api_suffix = "/search/" + category
-        url_params = {"sizeperpage": 50, "pageindex": page}
+        api_suffix = "/stations/" + category
+        url_params = {"count": 50, "offset": (page - 1) * 50}
 
         response = self.do_get(api_suffix, url_params)
 
-        if response.status_code != 200:
-            logger.error(
-                "Radio.net: Error on get station by "
-                + str(category)
-                + ". Error: "
-                + response.text
-            )
+        if response is None:
+            logger.error("Radio.net: Error on get station by " + str(category))
             return False
 
-        json = response.json()
-        self.set_cache(category, int(json["numberPages"]), 10)
-        return self.set_cache(cache_key, json["categories"][0]["matches"], 10)
+        self.set_cache(category, int(math.ceil(response["totalCount"] / 50)), 10)
+        return self.set_cache(cache_key, response["playables"], 10)
 
-    def get_sorted_category_pages(self, category, name):
+    def get_category_pages(self, category, name):
         cache_key = category + "/" + name
         cache = self.get_cache(cache_key)
         if cache is not None:
             return cache
 
-        self.get_sorted_category(category, name, "rank", 1)
+        self.get_category(category, name, 1)
 
         return self.get_cache(cache_key)
 
-    def get_category_pages(self, category):
+    def get_simple_category_pages(self, category):
         cache_key = category
         cache = self.get_cache(cache_key)
         if cache is not None:
             return cache
 
-        self.get_category(category, 1)
+        self.get_simple_category(category, 1)
 
         return self.get_cache(cache_key)
 
@@ -355,29 +338,25 @@ class RadioNetClient(object):
         favorite_stations = []
         for station_slug in self.favorites:
 
-            station = self.get_station_by_slug(station_slug)
+            station = self.get_station_by_id(station_slug)
 
             if station is False:
-                api_suffix = "/search/stationsonly"
+                api_suffix = "/stations/search"
                 url_params = {
                     "query": station_slug,
-                    "pageindex": 1,
+                    "count": 1,
+                    "offset": 0,
                 }
                 response = self.do_get(api_suffix, url_params)
 
-                if response.status_code != 200:
-                    logger.error("Radio.net: Search error " + response.text)
+                if response is None:
+                    logger.error("Radio.net: Search error")
                 else:
                     logger.debug("Radio.net: Done search")
-                    json = response.json()
 
-                    number_pages = int(json["numberPages"])
-
-                    if number_pages != 0:
+                    if "playables" in response and len(response["playables"]) > 0:
                         # take only the first match!
-                        station = self._get_station_from_search_result(
-                            json["categories"][0]["matches"][0]
-                        )
+                        station = self._get_station_from_search_result(response["playables"][0])
                     else:
                         logger.warning("Radio.net: No results for %s", station_slug)
 
@@ -391,29 +370,30 @@ class RadioNetClient(object):
 
     def do_search(self, query_string, page_index=1, search_results=None):
 
-        api_suffix = "/search/stationsonly"
+        api_suffix = "/stations/search"
         url_params = {
             "query": query_string,
-            "sizeperpage": 50,
-            "pageindex": page_index,
+            "count": 50,
+            "offset": (page_index - 1) * 50,
         }
-
+        logger.info(url_params)
         response = self.do_get(api_suffix, url_params)
 
-        if response.status_code != 200:
-            logger.error("Radio.net: Search error " + response.text)
+        if response is None:
+            logger.error("Radio.net: Search error")
         else:
-            logger.debug("Radio.net: Done search")
+            logger.info("Radio.net: Done search")
             if search_results is None:
                 search_results = []
-            json = response.json()
-            for match in json["categories"][0]["matches"]:
+            for match in response["playables"]:
                 station = self._get_station_from_search_result(match)
                 if station and station.playable:
                     search_results.append(station)
 
-            number_pages = int(json["numberPages"])
-            if number_pages >= page_index:
+            number_pages = int(math.ceil(response["totalCount"] / 50))
+            # Search is utterly broken, don't retrieve more than 10 pages
+            logger.info(page_index)
+            if number_pages > page_index and page_index < 10:
                 self.do_search(query_string, page_index + 1, search_results)
             else:
                 logger.info(
@@ -431,12 +411,13 @@ class RadioNetClient(object):
         stream_url = None
 
         for stream in stream_json:
-            if int(stream["bitRate"]) >= bit_rate and stream["streamStatus"] == "VALID":
-                stream_url = stream["streamUrl"]
+            logger.info("Radio.net: Found stream URL " + stream["url"])
+            if ("bitRate" in stream and int(stream["bitRate"]) >= bit_rate) and stream["status"] == "VALID":
+                stream_url = stream["url"]
                 break
 
         if stream_url is None and len(stream_json) > 0:
-            stream_url = stream_json[0]["streamUrl"]
+            stream_url = stream_json[0]["url"]
 
         return stream_url
 

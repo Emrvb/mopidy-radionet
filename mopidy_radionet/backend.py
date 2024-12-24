@@ -28,7 +28,6 @@ class RadioNetBackend(pykka.ThreadingActor, backend.Backend):
 
         self.radionet.min_bitrate = int(config["radionet"]["min_bitrate"])
         self.radionet.set_lang(str(config["radionet"]["language"]).strip())
-        self.radionet.set_apikey(str(config["radionet"]["api_key"]))
         self.radionet.set_favorites(
             tuple(
                 file_ext.strip("'").lower() for file_ext in config["radionet"]["favorite_stations"]
@@ -41,8 +40,9 @@ class RadioNetPlaybackProvider(backend.PlaybackProvider):
         return True
 
     def translate_uri(self, uri):
-        identifier = re.findall(r"^radionet:track:?([a-z0-9]+|\d+)?$", uri)
+        identifier = re.findall(r"^radionet:track:?(.+)?$", uri)
         if identifier:
+            print(identifier)
             return self.backend.radionet.get_stream_url(identifier[0])
 
         return None

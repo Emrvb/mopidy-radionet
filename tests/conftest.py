@@ -12,7 +12,6 @@ def backend_mock():
     backend_mock = mock.Mock(spec=backend.RadioNetBackend)
     backend_mock.radionet = RadioNetClient(proxy_config=None)
     backend_mock.library = RadioNetLibraryProvider(backend=backend_mock)
-    backend_mock.radionet.set_apikey('test')
     backend_mock.radionet.set_favorites({'lush'})
     return backend_mock
 
